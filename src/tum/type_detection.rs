@@ -248,23 +248,23 @@ fn compute_consistency_from_counts(type_counts: &[usize; Type::COUNT], total_cel
     max_non_null as f64 / non_null_total as f64
 }
 
-/// Infer the type for each column in a table.
-pub fn infer_column_types(table: &Table) -> Vec<Type> {
-    let num_cols = table.modal_field_count();
+/// Infer column types from borrowed rows without constructing or cloning a
+/// complete Table.
+pub fn infer_column_types_from_rows(rows: &[Vec<String>], num_cols: usize) -> Vec<Type> {
     let mut types = Vec::with_capacity(num_cols);
 
     for col_idx in 0..num_cols {
-        types.push(infer_single_column_type(table, col_idx));
+        types.push(infer_single_column_type(rows, col_idx));
     }
 
     types
 }
 
 /// Infer the type for a single column.
-fn infer_single_column_type(table: &Table, col_idx: usize) -> Type {
+fn infer_single_column_type(rows: &[Vec<String>], col_idx: usize) -> Type {
     let mut merged_type = Type::NULL;
 
-    for row in &table.rows {
+    for row in rows {
         if col_idx < row.len() {
             let cell_type = detect_cell_type(&row[col_idx]);
             merged_type = merged_type.merge(cell_type);
@@ -359,7 +359,7 @@ mod tests {
         table.field_counts = vec![3, 3, 3];
         table.update_modal_field_count();
 
-        let types = infer_column_types(&table);
+        let types = infer_column_types_from_rows(&table.rows, table.modal_field_count());
         assert_eq!(types, vec![Type::Unsigned, Type::Text, Type::Date]);
     }
 }

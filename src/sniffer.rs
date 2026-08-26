@@ -2,7 +2,6 @@
 //!
 //! This module provides the qsv-sniffer compatible API.
 
-use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Seek};
 use std::path::Path;
@@ -17,7 +16,7 @@ use crate::tum::potential_dialects::{
 };
 use crate::tum::score::{DialectScore, find_best_dialect, score_all_dialects_with_best_table};
 use crate::tum::table::{Table, parse_table};
-use crate::tum::type_detection::infer_column_types;
+use crate::tum::type_detection::infer_column_types_from_rows;
 
 /// Maximum buffer size for `SampleSize::Records` mode (100 MB).
 const MAX_RECORDS_BYTES: usize = 100 * 1024 * 1024;
@@ -227,28 +226,27 @@ impl Sniffer {
                 Ok(buffer)
             }
             SampleSize::Records(n) => {
-                // For records, we read enough to capture n records
-                // Estimate ~1KB per record as a starting point, with a minimum
-                let estimated_size = n.saturating_mul(1024).clamp(8192, MAX_RECORDS_BYTES);
-                let mut buffer = vec![0u8; estimated_size];
-                let bytes_read = fill(&mut reader, &mut buffer)?;
-                buffer.truncate(bytes_read);
+                const CHUNK_SIZE: usize = 64 * 1024;
 
-                // If we filled the estimate, we may not have enough records yet.
-                if bytes_read == estimated_size {
-                    // Count newlines to see if we have enough records
-                    let newlines = bytecount::count(&buffer, b'\n');
-                    if newlines < n {
-                        // Read more data, but never let the total exceed the
-                        // MAX_RECORDS_BYTES cap (cap against remaining capacity,
-                        // not just per-read).
-                        let remaining = MAX_RECORDS_BYTES.saturating_sub(buffer.len());
-                        let additional = (n - newlines).saturating_mul(2048).min(remaining);
-                        let mut more = vec![0u8; additional];
-                        let more_read = fill(&mut reader, &mut more)?;
-                        more.truncate(more_read);
-                        buffer.extend(more);
+                // Grow with the data that is actually available instead of
+                // reserving from the requested record count. Large record
+                // limits are commonly used to mean "inspect most of the file",
+                // including for files much smaller than the 100 MB cap.
+                let mut buffer = Vec::new();
+                let mut chunk = [0u8; CHUNK_SIZE];
+                let mut newlines = 0usize;
+                let target_newlines = n.max(1);
+
+                while newlines < target_newlines && buffer.len() < MAX_RECORDS_BYTES {
+                    let remaining = MAX_RECORDS_BYTES - buffer.len();
+                    let chunk_len = remaining.min(CHUNK_SIZE);
+                    let bytes_read = fill(&mut reader, &mut chunk[..chunk_len])?;
+                    if bytes_read == 0 {
+                        break;
                     }
+
+                    newlines += bytecount::count(&chunk[..bytes_read], b'\n');
+                    buffer.extend_from_slice(&chunk[..bytes_read]);
                 }
 
                 if buffer.len() >= MAX_RECORDS_BYTES {
@@ -286,26 +284,17 @@ impl Sniffer {
             return Err(SnifferError::EmptyData);
         }
 
-        // Create a view of the table without structural preamble
-        // (comment preamble rows are already stripped from data)
-        // Use Cow to avoid cloning in the common no-preamble case
-        let effective_table: Cow<'_, Table> =
-            if structural_preamble > 0 && table.rows.len() > structural_preamble {
-                let mut et = Table::new();
-                et.rows = table.rows[structural_preamble..].to_vec();
-                et.field_counts = table.field_counts[structural_preamble..].to_vec();
-                et.update_modal_field_count();
-                Cow::Owned(et)
-            } else {
-                Cow::Borrowed(table)
-            };
+        // Work with borrowed row slices so preamble and header removal do not
+        // deep-clone every String in the parsed table.
+        let effective_start = structural_preamble.min(table.rows.len());
+        let effective_rows = &table.rows[effective_start..];
 
         // Detect header on the effective table (pass total_preamble_rows for Header metadata)
-        let header = detect_header(&effective_table, total_preamble_rows);
+        let header = detect_header(effective_rows, total_preamble_rows);
 
         // Get field names from the effective table (first row after structural preamble)
-        let fields = if header.has_header_row && !effective_table.rows.is_empty() {
-            effective_table.rows[0].clone()
+        let fields = if header.has_header_row && !effective_rows.is_empty() {
+            effective_rows[0].clone()
         } else {
             // Generate field names
             (0..score.num_fields)
@@ -313,19 +302,15 @@ impl Sniffer {
                 .collect()
         };
 
-        // Skip header row for type inference if present
-        let data_table = if header.has_header_row && effective_table.rows.len() > 1 {
-            let mut dt = crate::tum::table::Table::new();
-            dt.rows = effective_table.rows[1..].to_vec();
-            dt.field_counts = effective_table.field_counts[1..].to_vec();
-            dt.update_modal_field_count();
-            dt
+        // Skip the header through a borrowed slice for type inference.
+        let data_rows = if header.has_header_row && effective_rows.len() > 1 {
+            &effective_rows[1..]
         } else {
-            effective_table.into_owned()
+            effective_rows
         };
 
         // Infer types for each column
-        let types = infer_column_types(&data_table);
+        let types = infer_column_types_from_rows(data_rows, score.num_fields);
 
         // Build dialect
         let dialect = Dialect {
@@ -353,18 +338,18 @@ impl Sniffer {
 /// Detect if the first row (after preamble) is likely a header row.
 ///
 /// Optimized: Computes type counts in a single pass without allocating Vecs.
-fn detect_header(table: &crate::tum::table::Table, preamble_rows: usize) -> Header {
-    if table.rows.is_empty() {
+fn detect_header(rows: &[Vec<String>], preamble_rows: usize) -> Header {
+    if rows.is_empty() {
         return Header::new(false, preamble_rows);
     }
 
-    if table.rows.len() < 2 {
+    if rows.len() < 2 {
         // Can't determine header with only one row
         return Header::new(false, preamble_rows);
     }
 
-    let first_row = &table.rows[0];
-    let second_row = &table.rows[1];
+    let first_row = &rows[0];
+    let second_row = &rows[1];
 
     // Heuristics for header detection:
     // 1. First row has different types than subsequent rows
@@ -578,6 +563,77 @@ fn detect_structural_preamble(table: &crate::tum::table::Table) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::detect_encoding;
+
+    #[test]
+    fn records_sample_does_not_reserve_the_maximum_before_reaching_eof() {
+        let data = vec![b'a'; 64 * 1024];
+        let mut sniffer = Sniffer::new();
+        sniffer.sample_size(SampleSize::Records(900_000));
+
+        crate::test_alloc::start_thread_allocation_count();
+        let sample = sniffer
+            .read_sample(std::io::Cursor::new(data.as_slice()))
+            .expect("sample should be readable");
+        let allocated_bytes = crate::test_alloc::finish_thread_allocation_count();
+
+        assert_eq!(sample, data);
+        assert!(
+            allocated_bytes <= data.len() * 4,
+            "reading a {}-byte sample allocated {} bytes ({:.1}x amplification)",
+            data.len(),
+            allocated_bytes,
+            allocated_bytes as f64 / data.len() as f64,
+        );
+    }
+
+    #[test]
+    fn metadata_building_does_not_clone_the_parsed_table() {
+        let mut data = String::from("column_one,column_two,column_three\n");
+        for row in 0..10_000 {
+            data.push_str(&format!("value{row:05},value{row:05},value{row:05}\n"));
+        }
+        let dialect = PotentialDialect::new(
+            b',',
+            Quote::Some(b'"'),
+            crate::tum::potential_dialects::LineTerminator::LF,
+        );
+        let table = parse_table(data.as_bytes(), &dialect, 0);
+        let score = crate::tum::score::score_dialect(data.as_bytes(), &dialect, 0);
+        let sniffer = Sniffer::new();
+        sniffer
+            .build_metadata(
+                &score,
+                detect_encoding(data.as_bytes()),
+                0,
+                0,
+                &table,
+                data.as_bytes(),
+            )
+            .expect("metadata warm-up should succeed");
+
+        crate::test_alloc::start_thread_allocation_count();
+        let metadata = sniffer
+            .build_metadata(
+                &score,
+                detect_encoding(data.as_bytes()),
+                0,
+                0,
+                &table,
+                data.as_bytes(),
+            )
+            .expect("metadata should be built");
+        let allocated_bytes = crate::test_alloc::finish_thread_allocation_count();
+
+        assert_eq!(metadata.num_fields, 3);
+        assert!(
+            allocated_bytes <= data.len(),
+            "metadata for a {}-byte sample allocated {} bytes ({:.1}x amplification)",
+            data.len(),
+            allocated_bytes,
+            allocated_bytes as f64 / data.len() as f64,
+        );
+    }
 
     #[test]
     fn test_sniffer_builder() {

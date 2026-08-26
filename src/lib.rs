@@ -72,6 +72,7 @@ pub use encoding::{EncodingInfo, detect_encoding, is_utf8};
 #[cfg(test)]
 pub(crate) mod test_alloc {
     use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     pub struct TrackingAllocator;
@@ -79,9 +80,19 @@ pub(crate) mod test_alloc {
     static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
     static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+    thread_local! {
+        static TRACK_THREAD_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static THREAD_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
     fn record_allocation(size: usize) {
         let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
         PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+        TRACK_THREAD_ALLOCATIONS.with(|tracking| {
+            if tracking.get() {
+                THREAD_ALLOCATED_BYTES.with(|bytes| bytes.set(bytes.get() + size));
+            }
+        });
     }
 
     fn record_deallocation(size: usize) {
@@ -134,6 +145,16 @@ pub(crate) mod test_alloc {
 
     pub fn peak_growth_since(baseline: usize) -> usize {
         PEAK_BYTES.load(Ordering::SeqCst).saturating_sub(baseline)
+    }
+
+    pub fn start_thread_allocation_count() {
+        THREAD_ALLOCATED_BYTES.with(|bytes| bytes.set(0));
+        TRACK_THREAD_ALLOCATIONS.with(|tracking| tracking.set(true));
+    }
+
+    pub fn finish_thread_allocation_count() -> usize {
+        TRACK_THREAD_ALLOCATIONS.with(|tracking| tracking.set(false));
+        THREAD_ALLOCATED_BYTES.with(Cell::get)
     }
 }
 
