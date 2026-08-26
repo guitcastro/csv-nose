@@ -1370,8 +1370,9 @@ pub fn score_all_dialects(
 /// dialect they ultimately select (which may differ from the top-gamma one due
 /// to tiebreakers) without relying on `scores` ordering.
 ///
-/// This avoids re-parsing the best dialect's data for preamble detection
-/// and metadata building.
+/// Candidate tables are released as soon as their scores are calculated.
+/// Once scoring is complete, only the best-scoring dialect is parsed again so
+/// callers can reuse that table for preamble detection and metadata building.
 pub fn score_all_dialects_with_best_table(
     data: &[u8],
     dialects: &[PotentialDialect],
@@ -1401,19 +1402,23 @@ pub fn score_all_dialects_with_best_table(
     // Pre-compute quote boundary counts for all delimiters in one pass (on normalized data)
     let boundary_counts = QuoteBoundaryCounts::new(normalized_bytes, &delimiters);
 
-    // Score all dialects in parallel, using per-thread reusable TypeScoreBuffers
-    let pairs: Vec<(DialectScore, Table)> = dialects
+    // Score all dialects in parallel, using per-thread reusable TypeScoreBuffers.
+    // Keep only the compact scores so candidate tables do not remain live until
+    // every dialect has finished scoring.
+    let mut scores: Vec<DialectScore> = dialects
         .par_iter()
         .map(|d| {
             BUFFERS.with(|b| {
-                score_dialect_with_normalized_data(
+                let (score, table) = score_dialect_with_normalized_data(
                     normalized_bytes,
                     d,
                     max_rows,
                     &quote_counts,
                     &boundary_counts,
                     &mut b.borrow_mut(),
-                )
+                );
+                drop(table);
+                score
             })
         })
         .collect();
@@ -1422,18 +1427,20 @@ pub fn score_all_dialects_with_best_table(
     // with the lower index (earlier in `dialects`) wins — matching the
     // original sequential `if score.gamma > best_gamma` loop which used
     // strict `>` so the first winner was never displaced by a tie.
-    let best_table = pairs
+    let best_dialect = scores
         .iter()
         .enumerate()
         .max_by(|(i, a), (j, b)| {
-            a.0.gamma
-                .partial_cmp(&b.0.gamma)
+            a.gamma
+                .partial_cmp(&b.gamma)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| j.cmp(i)) // lower index wins on tie
         })
-        .map(|(_, (s, t))| (s.dialect.clone(), t.clone()));
-
-    let mut scores: Vec<DialectScore> = pairs.into_iter().map(|(s, _)| s).collect();
+        .map(|(_, score)| score.dialect.clone());
+    let best_table = best_dialect.map(|dialect| {
+        let table = parse_table_normalized(normalized_bytes, &dialect, max_rows);
+        (dialect, table)
+    });
 
     // Sort by gamma score descending
     scores.sort_by(|a, b| {
@@ -1488,6 +1495,40 @@ mod tests {
         let best = find_best_dialect(&scores).unwrap();
 
         assert_eq!(best.dialect.delimiter, b',');
+    }
+
+    #[test]
+    fn scoring_dialects_stays_within_a_bounded_memory_amplification() {
+        let mut data =
+            String::from("column_one,column_two,column_three,column_four,column_five,column_six\n");
+        for row in 0..10_000 {
+            data.push_str(&format!(
+                "value{row:05},value{row:05},value{row:05},value{row:05},value{row:05},value{row:05}\n"
+            ));
+        }
+        let dialects =
+            crate::tum::potential_dialects::generate_dialects_with_terminator(LineTerminator::LF);
+
+        let baseline = crate::test_alloc::reset_peak();
+        let (_scores, best_table) =
+            score_all_dialects_with_best_table(data.as_bytes(), &dialects, 10_000);
+        let peak_growth = crate::test_alloc::peak_growth_since(baseline);
+        let amplification = peak_growth as f64 / data.len() as f64;
+
+        assert!(best_table.is_some());
+        eprintln!(
+            "dialect scoring used {} bytes above baseline for a {}-byte sample ({:.1}x amplification)",
+            peak_growth,
+            data.len(),
+            amplification,
+        );
+        assert!(
+            peak_growth <= data.len() * 48,
+            "dialect scoring used {} bytes above baseline for a {}-byte sample ({:.1}x amplification)",
+            peak_growth,
+            data.len(),
+            amplification,
+        );
     }
 
     #[test]
