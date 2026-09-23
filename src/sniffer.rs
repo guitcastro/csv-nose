@@ -45,6 +45,8 @@ pub struct Sniffer {
     forced_delimiter: Option<u8>,
     /// Optional forced quote character.
     forced_quote: Option<Quote>,
+    /// Whether to treat the first row as a header without detecting a preamble.
+    force_header: Option<bool>,
 }
 
 impl Default for Sniffer {
@@ -61,6 +63,7 @@ impl Sniffer {
             date_preference: DatePreference::MdyFormat,
             forced_delimiter: None,
             forced_quote: None,
+            force_header: None,
         }
     }
 
@@ -85,6 +88,12 @@ impl Sniffer {
     /// Force a specific quote character.
     pub fn quote(&mut self, quote: Quote) -> &mut Self {
         self.forced_quote = Some(quote);
+        self
+    }
+
+    /// Treat the first row as a header and skip preamble detection when `true`.
+    pub fn force_header(&mut self, force_header: bool) -> &mut Self {
+        self.force_header = Some(force_header);
         self
     }
 
@@ -119,8 +128,13 @@ impl Sniffer {
         // Skip BOM
         let data = skip_bom(data);
 
-        // Skip comment/preamble lines (lines starting with #)
-        let (comment_preamble_rows, data) = skip_preamble(data);
+        // A forced header makes the first input row the header, so keep all
+        // rows and report no preamble.
+        let (comment_preamble_rows, data) = if self.force_header == Some(true) {
+            (0, data)
+        } else {
+            skip_preamble(data)
+        };
 
         // Detect line terminator first to reduce search space
         let line_terminator = detect_line_terminator(data);
@@ -167,7 +181,11 @@ impl Sniffer {
             Some((dialect, table)) if dialect == best.dialect => table,
             _ => parse_table(data, &best.dialect, max_rows),
         };
-        let structural_preamble = detect_structural_preamble(&table_for_preamble);
+        let structural_preamble = if self.force_header == Some(true) {
+            0
+        } else {
+            detect_structural_preamble(&table_for_preamble)
+        };
 
         // Total preamble = comment rows + structural rows
         let total_preamble_rows = comment_preamble_rows + structural_preamble;
@@ -290,7 +308,11 @@ impl Sniffer {
         let effective_rows = &table.rows[effective_start..];
 
         // Detect header on the effective table (pass total_preamble_rows for Header metadata)
-        let header = detect_header(effective_rows, total_preamble_rows);
+        let header = if self.force_header == Some(true) {
+            Header::new(true, total_preamble_rows)
+        } else {
+            detect_header(effective_rows, total_preamble_rows)
+        };
 
         // Get field names from the effective table (first row after structural preamble)
         let fields = if header.has_header_row && !effective_rows.is_empty() {

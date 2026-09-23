@@ -155,6 +155,19 @@ fn test_forced_delimiter() {
 }
 
 #[test]
+fn test_force_header_assumes_first_row_is_header_without_preamble() {
+    let data = b"report_name,report_date\nname,age\nAlice,30\nBob,40\n";
+    let mut sniffer = Sniffer::new();
+    sniffer.force_header(true);
+
+    let metadata = sniffer.sniff_bytes(data).unwrap();
+
+    assert!(metadata.dialect.header.has_header_row);
+    assert_eq!(metadata.dialect.header.num_preamble_rows, 0);
+    assert_eq!(metadata.fields, vec!["report_name", "report_date"]);
+}
+
+#[test]
 fn test_sample_size_records() {
     let data = b"a,b\n1,2\n3,4\n5,6\n7,8\n9,10\n";
 
