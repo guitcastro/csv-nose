@@ -313,13 +313,18 @@ impl Sniffer {
         } else {
             detect_header(effective_rows, total_preamble_rows)
         };
+        let num_fields = if self.force_header == Some(true) {
+            effective_rows[0].len()
+        } else {
+            score.num_fields
+        };
 
         // Get field names from the effective table (first row after structural preamble)
         let fields = if header.has_header_row && !effective_rows.is_empty() {
             effective_rows[0].clone()
         } else {
             // Generate field names
-            (0..score.num_fields)
+            (0..num_fields)
                 .map(|i| format!("field_{}", i + 1))
                 .collect()
         };
@@ -332,7 +337,7 @@ impl Sniffer {
         };
 
         // Infer types for each column
-        let types = infer_column_types_from_rows(data_rows, score.num_fields);
+        let types = infer_column_types_from_rows(data_rows, num_fields);
 
         // Build dialect
         let dialect = Dialect {
@@ -350,7 +355,7 @@ impl Sniffer {
             dialect,
             encoding,
             avg_record_len,
-            score.num_fields,
+            num_fields,
             fields,
             types,
         ))
@@ -844,6 +849,23 @@ mod tests {
     fn test_no_preamble() {
         let data = b"a,b,c\n1,2,3\n4,5,6\n";
         let metadata = Sniffer::new().sniff_bytes(data).unwrap();
+        assert_eq!(metadata.dialect.header.num_preamble_rows, 0);
+    }
+
+    #[test]
+    fn forced_header_uses_the_header_field_count_for_metadata_and_types() {
+        let data = b"one,two,three,four,five,six,seven,eight,nine,ten,eleven\n\
+            a,b,c,d,e,f,g,h,i\n\
+            j,k,l,m,n,o,p,q,r\n";
+        let mut sniffer = Sniffer::new();
+        sniffer.force_header(true);
+
+        let metadata = sniffer.sniff_bytes(data).unwrap();
+
+        assert_eq!(metadata.num_fields, 11);
+        assert_eq!(metadata.fields.len(), 11);
+        assert_eq!(metadata.types.len(), 11);
+        assert!(metadata.dialect.header.has_header_row);
         assert_eq!(metadata.dialect.header.num_preamble_rows, 0);
     }
 
